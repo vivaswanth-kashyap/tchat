@@ -15,6 +15,7 @@ var rootCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(sendCmd)
 	rootCmd.AddCommand(readCmd)
+	rootCmd.AddCommand(chatCmd)
 }
 
 func Execute() {

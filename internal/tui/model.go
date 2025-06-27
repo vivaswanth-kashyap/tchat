@@ -1,111 +1,291 @@
 package tui
 
 import (
-	"log"
-	"sync"
+	"fmt"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
-	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
-	"github.com/vivaswanth-kashyap/tchat/internal/app"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/vivaswanth-kashyap/tchat/internal/models"
 )
 
-type ChatModel struct {
-	appClient *app.Client
-	logger    *log.Logger
-	config    *app.Config
+type ViewType int
+type InputType int
 
-	// UI Components\
-	viewport      viewport.Model
-	messageInput  textinput.Model
-	statusSpinner spinner.Model
-	channelList   list.Model
-	userList      list.Model
+const (
+	LoginView ViewType = iota
+	ChatView
+	ChannelListView
+	SettingsView
+)
 
-	// Application State
+const (
+	NoInput InputType = iota
+	UsernameInput
+	PasswordInput
+	MessageInput
+	ChannelSearchInput
+)
+
+type Model struct {
+	// Authentication state
+	isAuthenticated bool
+	authToken       string
+	currentUser     models.User
+	// UI state
+	currentView  ViewType
+	focusedInput InputType
+	// Messaging state
 	messages       []models.Message
-	currentChannel models.Channel
-	currentUser    models.User
-	dmRecipient    models.User
-
-	// Connection and Loading Status
-	connected      bool
-	connecting     bool
-	loadingHistory bool
-	errorMessage   string
-
-	// Sync for go routines
-	mu sync.Mutex
-
-	//view management
-	mode  AppMode // Current mode of the app (e.g., ChatMode, ConfigMode)
-	focus FocusableComponent
-
-	//Dimensions for layout
-	width, height int
+	currentChannel string
+	channels       []models.Channel
+	// Input handling
+	usernameInput textinput.Model
+	passwordInput textinput.Model
+	messageInput  textinput.Model
+	// UI components
+	viewport viewport.Model
+	list     list.Model
+	// Application state
+	loading      bool
+	error        error
+	windowWidth  int
+	windowHeight int
 }
 
-type AppMode int
+func initialModel() Model {
+	// Username input
+	usernameInput := textinput.New()
+	usernameInput.Placeholder = "Username"
+	usernameInput.Focus()
+	usernameInput.CharLimit = 50
+	usernameInput.Width = 30
 
-const (
-	ChatMode AppMode = iota
-)
+	// Password input
+	passwordInput := textinput.New()
+	passwordInput.Placeholder = "Password"
+	passwordInput.EchoMode = textinput.EchoPassword
+	passwordInput.CharLimit = 50
+	passwordInput.Width = 30
 
-// UI element currently has focus
-type FocusableComponent int
+	// Message input
+	messageInput := textinput.New()
+	messageInput.Placeholder = "Type a message..."
+	messageInput.CharLimit = 500
+	messageInput.Width = 50
 
-const (
-	InputFocus FocusableComponent = iota
-)
+	// Viewport and list
+	vp := viewport.New(80, 20)
+	l := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
+	l.Title = "Channels"
 
-// NewChatModel initializes a new ChatModel with default states and components.
+	return Model{
+		isAuthenticated: false,
+		authToken:       "",
+		currentUser:     models.User{},
+		currentView:     LoginView,
+		focusedInput:    UsernameInput,
+		messages:        []models.Message{},
+		currentChannel:  "",
+		channels:        []models.Channel{},
+		usernameInput:   usernameInput,
+		passwordInput:   passwordInput,
+		messageInput:    messageInput,
+		viewport:        vp,
+		list:            l,
+		loading:         false,
+		error:           nil,
+		windowWidth:     80,
+		windowHeight:    24,
+	}
+}
 
-// func NewChatModel(appClient *app.Client, appConfig *app.Config) ChatModel {
-// 	ti := textinput.New()
-// 	ti.Placeholder = "Type a message or /command..."
-// 	ti.Focus()         // Start with input field focused
-// 	ti.CharLimit = 200 // Max characters for a message
-// 	ti.Width = 80      // Default width, will be updated by Viewport
+func (m Model) Init() tea.Cmd {
+	return textinput.Blink
+}
 
-// 	vp := viewport.New(0, 0) // Width/height will be set in Update
-// 	vp.YOffset = 0           // Start at top of history
-// 	// Optional: vp.KeyMap.PgUp / vp.KeyMap.PgDown for navigation
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		case "tab":
+			if m.currentView == LoginView {
+				if m.focusedInput == UsernameInput {
+					m.focusedInput = PasswordInput
+					m.usernameInput.Blur()
+					m.passwordInput.Focus()
+				} else {
+					m.focusedInput = UsernameInput
+					m.passwordInput.Blur()
+					m.usernameInput.Focus()
+				}
+			}
+		case "enter":
+			if m.currentView == LoginView {
+				return m, m.handleLogin()
+			} else if m.currentView == ChatView && m.focusedInput == MessageInput {
+				return m, m.handleSendMessage()
+			}
+		}
 
-// 	s := spinner.New()
-// 	s.Spinner = spinner.Dot // Choose a spinner style
-// 	s.Style = styles.Theme.SpinnerStyle
+		// Update the focused input
+		var cmd tea.Cmd
+		switch m.focusedInput {
+		case UsernameInput:
+			m.usernameInput, cmd = m.usernameInput.Update(msg)
+		case PasswordInput:
+			m.passwordInput, cmd = m.passwordInput.Update(msg)
+		case MessageInput:
+			m.messageInput, cmd = m.messageInput.Update(msg)
+		}
+		return m, cmd
 
-// 	// Initialize with placeholder data
-// 	initialMessages := []models.Message{
-// 		{ID: "sys-welcome", Content: "Welcome to Tchat! Connecting...", Sender: "System", Timestamp: time.Now()},
-// 	}
+	case tea.WindowSizeMsg:
+		m.windowWidth = msg.Width
+		m.windowHeight = msg.Height
 
-// 	return ChatModel{
-// 		appClient: appClient,
-// 		logger:    log.Default(), // Consider using charm.sh/log for better logging
-// 		config:    appConfig,
+		// Resize viewport
+		m.viewport.Width = msg.Width
+		m.viewport.Height = msg.Height - 4
 
-// 		viewport:      vp,
-// 		messageInput:  ti,
-// 		statusSpinner: s,
-// 		// channelList:    list.New(...), // Initialize if you're using it
-// 		// userList:       list.New(...),
+		// Resize list
+		m.list.SetWidth(msg.Width)
+		m.list.SetHeight(msg.Height)
+		return m, nil
 
-// 		messages:       initialMessages,
-// 		connected:      false,
-// 		connecting:     true, // Assume connecting on startup
-// 		loadingHistory: false,
-// 		errorMessage:   "",
+	case LoginSuccessMsg:
+		m.isAuthenticated = true
+		m.authToken = msg.Token
+		m.currentUser = msg.User
+		m.currentView = ChatView
+		m.focusedInput = MessageInput
+		m.messageInput.Focus()
+		return m, nil
 
-// 		mode:  ChatMode,
-// 		focus: InputFocus,
-// 	}
-// }
+	case LoginErrorMsg:
+		m.error = msg.Error
+		return m, nil
+	}
 
-// Ensure you define custom message types in internal/tui/messages.go
-// Example:
-// type MsgReceived models.Message
-// type ConnectionStatusMsg bool
-// type ErrorMsg string
+	return m, nil
+}
+
+func (m Model) View() string {
+	switch m.currentView {
+	case LoginView:
+		return m.renderLoginView()
+	case ChatView:
+		return m.renderChatView()
+	case ChannelListView:
+		return m.renderChannelListView()
+	default:
+		return "Loading..."
+	}
+}
+
+func (m Model) renderLoginView() string {
+	var s strings.Builder
+
+	s.WriteString(" Welcome to TChat\n\n")
+
+	if m.error != nil {
+		s.WriteString(fmt.Sprintf("❌ Error: %v\n\n", m.error))
+	}
+
+	if m.loading {
+		s.WriteString("⏳ Logging in...\n\n")
+	}
+
+	s.WriteString("Username:\n")
+	s.WriteString(m.usernameInput.View() + "\n\n")
+
+	s.WriteString("Password:\n")
+	s.WriteString(m.passwordInput.View() + "\n\n")
+
+	s.WriteString("Press Enter to login, Tab to switch fields, Ctrl+C to quit")
+
+	return s.String()
+}
+
+func (m Model) renderChatView() string {
+	var s strings.Builder
+
+	// Header
+	channelName := m.currentChannel
+	if channelName == "" {
+		channelName = "General"
+	}
+	s.WriteString(fmt.Sprintf("💬 Channel: #%s\n", channelName))
+	s.WriteString(strings.Repeat("─", m.windowWidth) + "\n")
+
+	// Messages viewport
+	s.WriteString(m.viewport.View() + "\n")
+
+	// Input area
+	s.WriteString(strings.Repeat("─", m.windowWidth) + "\n")
+	s.WriteString(m.messageInput.View())
+
+	return s.String()
+}
+
+func (m Model) renderChannelListView() string {
+	return m.list.View()
+}
+
+// Helper command functions
+func (m Model) handleLogin() tea.Cmd {
+	username := m.usernameInput.Value()
+	password := m.passwordInput.Value()
+
+	// Validate inputs
+	if username == "" || password == "" {
+		return func() tea.Msg {
+			return LoginErrorMsg{Error: fmt.Errorf("username and password are required")}
+		}
+	}
+
+	return func() tea.Msg {
+		// TODO: Replace with actual auth service call
+		// For now, simulate successful login
+		if username == "demo" && password == "demo" {
+			return LoginSuccessMsg{
+				Token: "demo-jwt-token",
+				User:  models.User{Username: username},
+			}
+		}
+		return LoginErrorMsg{Error: fmt.Errorf("invalid credentials")}
+	}
+}
+
+func (m Model) handleSendMessage() tea.Cmd {
+	message := m.messageInput.Value()
+	if message == "" {
+		return nil
+	}
+
+	// Clear the input
+	m.messageInput.SetValue("")
+
+	return func() tea.Msg {
+		// TODO: Send message to your backend
+		return MessageSentMsg{Content: message}
+	}
+}
+
+// Custom message types
+type LoginSuccessMsg struct {
+	Token string
+	User  models.User
+}
+
+type LoginErrorMsg struct {
+	Error error
+}
+
+type MessageSentMsg struct {
+	Content string
+}
